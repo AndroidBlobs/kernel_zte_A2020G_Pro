@@ -67,6 +67,10 @@
 #define CORE_FTRIM_ILIM_REG		0x1030
 #define CFG_ILIM_MASK			GENMASK(4, 0)
 
+#define CORE_FTRIM_OSC			0x1032
+#define CFG_OSC_MASK			GENMASK(4, 0)
+#define CFG_OSC_800KHZ			0x07
+
 #define CORE_FTRIM_LVL_REG		0x1033
 #define CFG_WIN_HI_MASK			GENMASK(3, 2)
 #define WIN_OV_LVL_1000MV		0x08
@@ -87,9 +91,11 @@
 #define ILIM_VOTER		"ILIM_VOTER"
 #define FCC_VOTER		"FCC_VOTER"
 #define ICL_VOTER		"ICL_VOTER"
+#define TAPER_END_VOTER		"TAPER_END_VOTER"
 #define WIRELESS_VOTER		"WIRELESS_VOTER"
 #define SRC_VOTER		"SRC_VOTER"
 #define SWITCHER_TOGGLE_VOTER	"SWITCHER_TOGGLE_VOTER"
+#define SOC_LEVEL_VOTER		"SOC_LEVEL_VOTER"
 
 enum {
 	SWITCHER_OFF_WINDOW_IRQ = 0,
@@ -126,6 +132,7 @@ struct smb1390 {
 	struct votable		*disable_votable;
 	struct votable		*ilim_votable;
 	struct votable		*fcc_votable;
+	struct votable		*fv_votable;
 	struct votable		*cp_awake_votable;
 
 	/* power supplies */
@@ -138,6 +145,8 @@ struct smb1390 {
 	bool			taper_work_running;
 	struct smb1390_iio	iio;
 	int			irq_status;
+	int			taper_entry_fv;
+	u32			max_cutoff_soc;
 };
 
 struct smb_irq {
@@ -178,7 +187,7 @@ static bool is_psy_voter_available(struct smb1390 *chip)
 	if (!chip->batt_psy) {
 		chip->batt_psy = power_supply_get_by_name("battery");
 		if (!chip->batt_psy) {
-			pr_debug("Couldn't find battery psy\n");
+			pr_err("Couldn't find battery psy\n");
 			return false;
 		}
 	}
@@ -186,7 +195,7 @@ static bool is_psy_voter_available(struct smb1390 *chip)
 	if (!chip->usb_psy) {
 		chip->usb_psy = power_supply_get_by_name("usb");
 		if (!chip->usb_psy) {
-			pr_debug("Couldn't find usb psy\n");
+			pr_err("Couldn't find usb psy\n");
 			return false;
 		}
 	}
@@ -194,7 +203,7 @@ static bool is_psy_voter_available(struct smb1390 *chip)
 	if (!chip->dc_psy) {
 		chip->dc_psy = power_supply_get_by_name("dc");
 		if (!chip->dc_psy) {
-			pr_debug("Couldn't find dc psy\n");
+			pr_err("Couldn't find dc psy\n");
 			return false;
 		}
 	}
@@ -202,7 +211,15 @@ static bool is_psy_voter_available(struct smb1390 *chip)
 	if (!chip->fcc_votable) {
 		chip->fcc_votable = find_votable("FCC");
 		if (!chip->fcc_votable) {
-			pr_debug("Couldn't find FCC votable\n");
+			pr_err("Couldn't find FCC votable\n");
+			return false;
+		}
+	}
+
+	if (!chip->fv_votable) {
+		chip->fv_votable = find_votable("FV");
+		if (!chip->fv_votable) {
+			pr_debug("Couldn't find FV votable\n");
 			return false;
 		}
 	}
@@ -218,6 +235,28 @@ static void cp_toggle_switcher(struct smb1390 *chip)
 	usleep_range(20, 30);
 
 	vote(chip->disable_votable, SWITCHER_TOGGLE_VOTER, false, 0);
+}
+
+static int smb1390_is_batt_soc_valid(struct smb1390 *chip)
+{
+	int rc;
+	union power_supply_propval pval = {0, };
+
+	if (!chip->batt_psy)
+		goto out;
+
+	rc = power_supply_get_property(chip->batt_psy,
+			POWER_SUPPLY_PROP_CAPACITY, &pval);
+	if (rc < 0) {
+		pr_err("Couldn't get CAPACITY rc=%d\n", rc);
+		goto out;
+	}
+
+	if (pval.intval >= chip->max_cutoff_soc)
+		return false;
+
+out:
+	return true;
 }
 
 static irqreturn_t default_irq_handler(int irq, void *data)
@@ -382,6 +421,7 @@ static ssize_t die_temp_show(struct class *c, struct class_attribute *attr,
 		return -EINVAL;
 	}
 
+	pr_info("die_temp_deciC:%d\n", die_temp_deciC);
 	return snprintf(buf, PAGE_SIZE, "%d\n", die_temp_deciC / 100);
 }
 static CLASS_ATTR_RO(die_temp);
@@ -422,6 +462,7 @@ unlock:
 
 	/* ISNS = 2 * (1496 - 1390_therm_input * 0.00356) * 1000 uA */
 	isns_ma = (1496 * 1000 - div_s64((s64)temp * 3560, 1000)) * 2;
+	pr_info("temp:%d, isns_ma:%d\n", temp, isns_ma);
 	return snprintf(buf, PAGE_SIZE, "%d\n", isns_ma);
 }
 static CLASS_ATTR_RO(isns);
@@ -445,6 +486,7 @@ static int smb1390_disable_vote_cb(struct votable *votable, void *data,
 	struct smb1390 *chip = data;
 	int rc = 0;
 
+	pr_info("client:%s disable:%d\n", client, disable);
 	if (!is_psy_voter_available(chip))
 		return -EAGAIN;
 
@@ -474,6 +516,7 @@ static int smb1390_ilim_vote_cb(struct votable *votable, void *data,
 	struct smb1390 *chip = data;
 	int rc = 0;
 
+	pr_info("client:%s ilim_uA:%d\n", client, ilim_uA);
 	if (!is_psy_voter_available(chip))
 		return -EAGAIN;
 
@@ -485,10 +528,10 @@ static int smb1390_ilim_vote_cb(struct votable *votable, void *data,
 
 	/* ILIM less than 1A is not accurate; disable charging */
 	if (ilim_uA < 1000000) {
-		pr_debug("ILIM %duA is too low to allow charging\n", ilim_uA);
+		pr_info("ILIM %duA is too low to allow charging\n", ilim_uA);
 		vote(chip->disable_votable, ILIM_VOTER, true, 0);
 	} else {
-		pr_debug("setting ILIM to %duA\n", ilim_uA);
+		pr_info("setting ILIM to %duA\n", ilim_uA);
 		rc = smb1390_masked_write(chip, CORE_FTRIM_ILIM_REG,
 				CFG_ILIM_MASK,
 				DIV_ROUND_CLOSEST(ilim_uA - 500000, 100000));
@@ -550,6 +593,9 @@ static void smb1390_status_change_work(struct work_struct *work)
 	if (!is_psy_voter_available(chip))
 		goto out;
 
+	vote(chip->disable_votable, SOC_LEVEL_VOTER,
+			smb1390_is_batt_soc_valid(chip) ? false : true, 0);
+
 	rc = power_supply_get_property(chip->usb_psy,
 			POWER_SUPPLY_PROP_SMB_EN_MODE, &pval);
 	if (rc < 0) {
@@ -597,6 +643,14 @@ static void smb1390_status_change_work(struct work_struct *work)
 				get_effective_result(chip->fcc_votable) / 2);
 
 		/*
+		 * Remove SMB1390 Taper condition disable vote if float voltage
+		 * increased in comparison to voltage at which it entered taper.
+		 */
+		if (chip->taper_entry_fv <
+				get_effective_result(chip->fv_votable))
+			vote(chip->disable_votable, TAPER_END_VOTER, false, 0);
+
+		/*
 		 * all votes that would result in disabling the charge pump have
 		 * been cast; ensure the charhe pump is still enabled before
 		 * continuing.
@@ -622,10 +676,12 @@ static void smb1390_status_change_work(struct work_struct *work)
 		}
 	} else {
 		vote(chip->disable_votable, SRC_VOTER, true, 0);
+		vote(chip->disable_votable, TAPER_END_VOTER, false, 0);
 		max_fcc_ma = get_client_vote(chip->fcc_votable,
 				BATT_PROFILE_VOTER);
 		vote(chip->fcc_votable, CP_VOTER,
 				max_fcc_ma > 0 ? true : false, max_fcc_ma);
+		vote(chip->disable_votable, SOC_LEVEL_VOTER, true, 0);
 	}
 
 out:
@@ -642,17 +698,8 @@ static void smb1390_taper_work(struct work_struct *work)
 	if (!is_psy_voter_available(chip))
 		goto out;
 
-	do {
-		fcc_uA = get_effective_result(chip->fcc_votable);
-		if (fcc_uA < 2000000)
-			break;
-
-		fcc_uA = get_client_vote(chip->fcc_votable, CP_VOTER) - 100000;
-		pr_debug("taper work reducing FCC to %duA\n", fcc_uA);
-		vote(chip->fcc_votable, CP_VOTER, true, fcc_uA);
-
-		msleep(500);
-
+	chip->taper_entry_fv = get_effective_result(chip->fv_votable);
+	while (true) {
 		rc = power_supply_get_property(chip->batt_psy,
 					POWER_SUPPLY_PROP_CHARGE_TYPE, &pval);
 		if (rc < 0) {
@@ -660,10 +707,36 @@ static void smb1390_taper_work(struct work_struct *work)
 			goto out;
 		}
 
-	} while (pval.intval == POWER_SUPPLY_CHARGE_TYPE_TAPER);
+		if (get_effective_result(chip->fv_votable) >
+						chip->taper_entry_fv) {
+			pr_debug("Float voltage increased. Exiting taper\n");
+			goto out;
+		} else {
+			chip->taper_entry_fv =
+					get_effective_result(chip->fv_votable);
+		}
+
+		if (pval.intval == POWER_SUPPLY_CHARGE_TYPE_TAPER) {
+			fcc_uA = get_client_vote(chip->fcc_votable, CP_VOTER)
+								- 100000;
+			pr_info("taper work reducing FCC to %duA\n", fcc_uA);
+			vote(chip->fcc_votable, CP_VOTER, true, fcc_uA);
+
+			if (fcc_uA < 2000000) {
+				vote(chip->disable_votable, TAPER_END_VOTER,
+								true, 0);
+				goto out;
+			}
+		} else {
+			pr_debug("In fast charging. Wait for next taper\n");
+		}
+
+		msleep(500);
+	}
 
 out:
 	pr_debug("taper work exit\n");
+	vote(chip->fcc_votable, CP_VOTER, false, 0);
 	chip->taper_work_running = false;
 }
 
@@ -686,6 +759,10 @@ static int smb1390_parse_dt(struct smb1390 *chip)
 			return rc;
 		}
 	}
+
+	chip->max_cutoff_soc = 85; /* 85% */
+	of_property_read_u32(chip->dev->of_node, "qcom,max-cutoff-soc",
+			&chip->max_cutoff_soc);
 
 	return rc;
 }
@@ -732,6 +809,9 @@ static int smb1390_init_hw(struct smb1390 *chip)
 	 * traditional parallel charging if present
 	 */
 	vote(chip->disable_votable, USER_VOTER, true, 0);
+	/* keep charge pump disabled if SOC is above threshold */
+	vote(chip->disable_votable, SOC_LEVEL_VOTER,
+			smb1390_is_batt_soc_valid(chip) ? false : true, 0);
 
 	/*
 	 * Improve ILIM accuracy:
@@ -745,6 +825,15 @@ static int smb1390_init_hw(struct smb1390 *chip)
 
 	rc = smb1390_masked_write(chip, CORE_FTRIM_MISC_REG,
 			TR_WIN_1P5X_BIT, WINDOW_DETECTION_DELTA_X1P0);
+	if (rc < 0)
+		return rc;
+
+	/*
+	 * SMB-1390-0-42CWLNSP-HR-03-0-00 use 800khz for single
+	 * SMB-1390-0-42CWLNSP-HR-03-0-01 use 400khz for dual
+	 */
+	rc = smb1390_masked_write(chip, CORE_FTRIM_OSC,
+			CFG_OSC_MASK, CFG_OSC_800KHZ);
 	if (rc < 0)
 		return rc;
 
@@ -915,6 +1004,7 @@ static int smb1390_remove(struct platform_device *pdev)
 
 	/* explicitly disable charging */
 	vote(chip->disable_votable, USER_VOTER, true, 0);
+	vote(chip->disable_votable, SOC_LEVEL_VOTER, true, 0);
 	cancel_work(&chip->taper_work);
 	cancel_work(&chip->status_change_work);
 	wakeup_source_unregister(chip->cp_ws);
