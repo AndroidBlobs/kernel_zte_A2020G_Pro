@@ -322,6 +322,8 @@ static int vote_clock_on(struct uart_port *uport)
 	int usage_count = atomic_read(&uport->dev->power.usage_count);
 	int ret = 0;
 
+	dev_err(uport->dev, "%s: Enter -->\n", __func__);
+
 	ret = msm_geni_serial_power_on(uport);
 	if (ret) {
 		dev_err(uport->dev, "Failed to vote clock on\n");
@@ -337,6 +339,8 @@ static int vote_clock_off(struct uart_port *uport)
 {
 	struct msm_geni_serial_port *port = GET_DEV_PORT(uport);
 	int usage_count = atomic_read(&uport->dev->power.usage_count);
+
+	dev_err(uport->dev, "%s: Enter -->\n", __func__);
 
 	if (!pm_runtime_enabled(uport->dev)) {
 		dev_err(uport->dev, "RPM not available.Can't enable clocks\n");
@@ -2547,6 +2551,8 @@ static int msm_geni_serial_runtime_suspend(struct device *dev)
 	u32 geni_status = geni_read_reg_nolog(port->uport.membase,
 							SE_GENI_STATUS);
 
+	dev_err(dev, "%s: Enter -->\n", __func__);
+
 	wait_for_transfers_inflight(&port->uport);
 	/*
 	 * Disable Interrupt
@@ -2580,6 +2586,7 @@ static int msm_geni_serial_runtime_resume(struct device *dev)
 	struct msm_geni_serial_port *port = platform_get_drvdata(pdev);
 	int ret = 0;
 
+	dev_err(dev, "%s: Enter -->\n", __func__);
 	/*
 	 * Do an unconditional relax followed by a stay awake in case the
 	 * wake source is activated by the wakeup isr.
@@ -2616,6 +2623,7 @@ static int msm_geni_serial_sys_suspend_noirq(struct device *dev)
 	struct msm_geni_serial_port *port = platform_get_drvdata(pdev);
 	struct uart_port *uport = &port->uport;
 
+	dev_err(dev, "%s: Enter -->\n", __func__);
 	if (uart_console(uport)) {
 		uart_suspend_port((struct uart_driver *)uport->private_data,
 					uport);
